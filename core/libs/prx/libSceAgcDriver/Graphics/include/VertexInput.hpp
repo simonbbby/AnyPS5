@@ -134,7 +134,12 @@ inline std::size_t VertexBufferExtent(const ShaderRecompiler::VertexAttribute& a
     return static_cast<std::size_t>(bytes);
 }
 
-inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute& attribute, std::uint32_t maxIndex, std::uint32_t instances, std::uint32_t firstInstance = 0) {
+struct VertexRead {
+    std::size_t guest;
+    std::size_t bytes;
+};
+
+inline VertexRead VertexBufferRead(const ShaderRecompiler::VertexAttribute& attribute, std::uint32_t maxIndex, std::uint32_t instances, std::uint32_t firstInstance = 0) {
     Require(instances != 0, "vertex input requires nonzero instance count");
     Require(firstInstance <= std::numeric_limits<std::uint32_t>::max() - (instances - 1u), "vertex input instance range overflow");
     const auto stride = (attribute.resource.fields[1] >> 16u) & 0x3fffu;
@@ -142,13 +147,15 @@ inline std::size_t VertexBufferReadSize(const ShaderRecompiler::VertexAttribute&
     Require(attribute.fetchIndex <= 1, "unsupported vertex fetch index");
     const auto index = attribute.fetchIndex == 0 ? maxIndex : firstInstance + instances - 1u;
     const auto bytes = DecodeVertexFormat(attribute).bytes;
-    Require(stride == 0 || index < records, "vertex fetch exceeds descriptor record count");
+    const bool pastRecords = stride != 0 && index >= records;
+    Require(!pastRecords || ((attribute.resource.fields[3] >> 28u) & 3u) <= 1u, "vertex fetch exceeds descriptor record count");
     const auto available = stride == 0 ? static_cast<std::uint64_t>(records) : static_cast<std::uint64_t>(records) * stride;
     const auto required = static_cast<std::uint64_t>(stride) * index + bytes;
-    Require(required <= available && required <= std::numeric_limits<std::size_t>::max(), "vertex fetch exceeds descriptor byte range");
+    const auto guest = !pastRecords ? required : records == 0 ? 0u : static_cast<std::uint64_t>(stride) * (records - 1u) + bytes;
+    Require(guest <= available && required <= std::numeric_limits<std::size_t>::max(), "vertex fetch exceeds descriptor byte range");
     const auto address = attribute.resource.fields[0] | (static_cast<std::uint64_t>(attribute.resource.fields[1] & 0xffffu) << 32u);
     Require(address != 0 && required <= std::numeric_limits<std::uint64_t>::max() - address, "invalid vertex buffer address range");
-    return static_cast<std::size_t>(required);
+    return {static_cast<std::size_t>(guest), static_cast<std::size_t>(required)};
 }
 
 struct VertexFetch {
@@ -157,10 +164,12 @@ struct VertexFetch {
     std::uint32_t stride;
     std::uint32_t fetchIndex;
     std::uint32_t alignment;
+    std::uint64_t zeroBytes = 0;
 };
 
 struct VertexCopyPlan {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> copies;
+    std::vector<std::uint64_t> zeroBytes;
     std::vector<std::size_t> copyOf;
     std::vector<std::uint64_t> offsets;
 };
@@ -181,11 +190,12 @@ inline VertexCopyPlan PlanVertexCopies(std::span<const VertexFetch> fetches) {
     std::size_t lead = fetches.size();
     for (const auto i : order) {
         const auto& fetch = fetches[i];
-        Require(fetch.begin < fetch.end && fetch.alignment != 0, "empty vertex fetch range");
-        const bool joins = lead != fetches.size() && fetch.stride != 0 && fetches[lead].stride == fetch.stride && fetches[lead].fetchIndex == fetch.fetchIndex && fetch.begin - fetches[lead].begin < fetch.stride && (fetch.begin - fetches[lead].begin) % fetch.alignment == 0;
+        Require(fetch.begin < fetch.end && fetch.alignment != 0 && fetch.zeroBytes <= fetch.end - fetch.begin, "empty vertex fetch range");
+        const bool joins = lead != fetches.size() && fetch.zeroBytes == 0 && fetches[lead].zeroBytes == 0 && fetch.stride != 0 && fetches[lead].stride == fetch.stride && fetches[lead].fetchIndex == fetch.fetchIndex && fetch.begin - fetches[lead].begin < fetch.stride && (fetch.begin - fetches[lead].begin) % fetch.alignment == 0;
         if (!joins) {
             lead = i;
             plan.copies.emplace_back(fetch.begin, fetch.end);
+            plan.zeroBytes.push_back(fetch.zeroBytes);
         }
         auto& copy = plan.copies.back();
         copy.second = std::max(copy.second, fetch.end);

@@ -885,19 +885,33 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     fetches.reserve(attributes.size());
     for (const auto& attribute : attributes) {
         // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
-        const auto bytes = args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
+        const auto extent = args != nullptr ? VertexBufferExtent(attribute) : 0u;
+        const auto read = args != nullptr ? VertexRead{extent, extent} : VertexBufferRead(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance);
         const auto& fields = attribute.resource.fields;
         const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
-        Require(!state.hasColorTarget || address + bytes <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
-        fetches.push_back({address, address + bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
+        Require(!state.hasColorTarget || address + read.guest <= state.color.address || state.color.address + state.color.bytes <= address, "vertex buffer aliases the render target");
+        fetches.push_back({address, address + read.bytes, (fields[1] >> 16u) & 0x3fffu, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment, read.bytes - read.guest});
     }
     const auto plan = PlanVertexCopies(fetches);
-    for (const auto& [begin, end] : plan.copies) {
+    for (std::size_t i = 0; i < plan.copies.size(); ++i) {
+        const auto [begin, end] = plan.copies[i];
         const auto bytes = static_cast<std::size_t>(end - begin);
-        GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
-        auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
-        KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        inputs.vertexBuffers.push_back(std::move(copy.buffer));
+        if (plan.zeroBytes[i] == 0) {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+            auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
+            KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+            inputs.vertexBuffers.push_back(std::move(copy.buffer));
+            continue;
+        }
+        const auto guest = bytes - static_cast<std::size_t>(plan.zeroBytes[i]);
+        auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        const auto data = buffer->Bytes();
+        if (guest != 0) {
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), guest, 1);
+            GuestMemory::Read(begin, data.first(guest), 1);
+        }
+        std::fill(data.begin() + static_cast<std::ptrdiff_t>(guest), data.end(), std::byte{0});
+        inputs.vertexBuffers.push_back(std::move(buffer));
     }
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         inputs.vertexHandles.push_back(inputs.vertexBuffers[plan.copyOf[i]]->Handle());

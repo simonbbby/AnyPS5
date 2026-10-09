@@ -2506,19 +2506,35 @@ void validationTests() {
         AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false);
         vertex.vertexAttributes[0].components = 2;
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "metadata disagrees");
-        Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 2, 1) == 80, "incorrect strided vertex range");
-        expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 3, 1); }, "record count");
+        const auto read = [&](std::uint32_t maxIndex, std::uint32_t instances, std::uint32_t firstInstance, std::size_t guest, std::size_t bytes) {
+            const auto range = AgcDriver::Graphics::VertexBufferRead(attribute, maxIndex, instances, firstInstance);
+            return range.guest == guest && range.bytes == bytes;
+        };
+        Require(read(2, 1, 0, 80, 80), "incorrect strided vertex range");
+        Require(read(3, 1, 0, 80, 112), "a vertex past the records was not read as zeros");
+        Require(read(5, 1, 0, 80, 176), "vertices past the records were not read as zeros");
+        attribute.resource.fields[3] |= 1u << 28u;
+        Require(read(3, 1, 0, 80, 112), "OOB_SELECT 1 did not read past the records as zeros");
+        for (const auto select : {2u, 3u}) {
+            attribute.resource.fields[3] = (77u << 12u) | (select << 28u);
+            expectFailure([&] { AgcDriver::Graphics::VertexBufferRead(attribute, 3, 1); }, "record count");
+            Require(read(2, 1, 0, 80, 80), "an unmeasured OOB_SELECT changed in-range reads");
+        }
+        attribute.resource.fields[3] = 77u << 12u;
+        attribute.resource.fields[2] = 0;
+        Require(read(0, 1, 0, 0, 16), "a descriptor without records was not read as zeros");
+        attribute.resource.fields[2] = 3;
         attribute.fetchIndex = 1;
-        Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 48, "instance attributes used the vertex index");
-        Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2, 1) == 80, "first instance was ignored");
-        expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 2, 2); }, "record count");
-        expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 2, 0xffffffffu); }, "instance range overflow");
-        expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 4); }, "record count");
+        Require(read(100, 2, 0, 48, 48), "instance attributes used the vertex index");
+        Require(read(100, 2, 1, 80, 80), "first instance was ignored");
+        Require(read(0, 2, 2, 80, 112), "an instance past the records was not read as zeros");
+        expectFailure([&] { AgcDriver::Graphics::VertexBufferRead(attribute, 0, 2, 0xffffffffu); }, "instance range overflow");
+        Require(read(0, 4, 0, 80, 112), "instances past the records were not read as zeros");
         attribute.resource.fields[1] = 0;
         attribute.resource.fields[2] = 16;
-        Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 16, "zero stride must repeat one value");
+        Require(read(100, 2, 0, 16, 16), "zero stride must repeat one value");
         attribute.resource.fields[2] = 8;
-        expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 1); }, "byte range");
+        expectFailure([&] { AgcDriver::Graphics::VertexBufferRead(attribute, 0, 1); }, "byte range");
         attribute.resource.fields[3] = 113u << 12u;
         expectFailure([&] { AgcDriver::Graphics::DecodeVertexFormat(attribute); }, "unsupported vertex format");
         attribute.resource.fields[3] = 50u << 12u;
@@ -2764,8 +2780,18 @@ void vertexCopyTests() {
         Require(plan.copies.size() == 1 && plan.copies[0].second == 0x3102 && plan.offsets[1] == 2, "aligned 16-bit attributes of one record were not merged");
     }
     {
+        const std::array<VertexFetch, 3> fetches{{{0x5000, 0x5000 + 24 * 3 + 16, 24, 0, 4, 24}, {0x5010, 0x5010 + 24 * 3 + 8, 24, 0, 4}, {0x5000, 0x5000 + 24 * 2 + 16, 24, 0, 4}}};
+        const auto plan = PlanVertexCopies(fetches);
+        Require(plan.copies.size() == 2 && plan.copyOf[0] != plan.copyOf[1] && plan.copyOf[1] == plan.copyOf[2], "a fetch with zeros past its records shared a copy");
+        Require(plan.zeroBytes[plan.copyOf[0]] == 24 && plan.zeroBytes[plan.copyOf[1]] == 0, "zero bytes were not kept per copy");
+        const auto& zeroed = plan.copies[plan.copyOf[0]];
+        Require(zeroed.first == 0x5000 && zeroed.second == 0x5000 + 24 * 3 + 16 && plan.offsets[0] == 0, "a fetch with zeros past its records was not copied exactly");
+    }
+    {
         const std::array<VertexFetch, 1> empty{{{0x4000, 0x4000, 16, 0, 4}}};
         expectFailure([&] { PlanVertexCopies(empty); }, "empty vertex fetch");
+        const std::array<VertexFetch, 1> oversized{{{0x4000, 0x4010, 16, 0, 4, 0x20}}};
+        expectFailure([&] { PlanVertexCopies(oversized); }, "empty vertex fetch");
     }
 }
 
